@@ -1,0 +1,173 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TOD CHARGES — DASHBOARD CARD
+# File: TOD.dashboard   (sensors: TOD.yaml)
+#
+# Shows a 24-hour clock ring coloured by rate period (green Off-Peak, yellow
+# Mid-Peak, red On-Peak) with a hand at the current time and the current rate,
+# then a table of today's use, solar credit and cost per period, a Today
+# total, and the billing period to date. Tap the card for the bill sensor.
+#
+# NEEDS
+#   - TOD.yaml installed (sensor.tod_rate, sensor.tod_today, sensor.tod_bill)
+#   - button-card from HACS (custom:button-card)
+#
+# INSTALL
+#   Edit dashboard → Add card → Manual, then paste everything below this
+#   header (from "type:" down) and Save.
+# ─────────────────────────────────────────────────────────────────────────────
+type: custom:button-card
+entity: sensor.tod_rate
+name: TOD Charges
+show_icon: false
+show_state: false
+tap_action:
+  action: more-info
+  entity: sensor.tod_bill
+triggers_update:
+- sensor.tod_today
+- sensor.tod_bill
+- sensor.tod_rate
+grid_options:
+  columns: 12
+  rows: auto
+styles:
+  card:
+  - padding: 12px 16px 16px
+  grid:
+  - grid-template-areas: '"n" "sub" "clock" "legend"'
+  - grid-template-columns: 1fr
+  - grid-template-rows: min-content min-content 1fr min-content
+  - row-gap: 6px
+  name:
+  - justify-self: start
+  - font-size: 20px
+  - font-weight: 600
+  custom_fields:
+    sub:
+    - justify-self: start
+    - font-size: 12px
+    - color: var(--secondary-text-color)
+    clock:
+    - justify-self: center
+    - width: 100%
+    - max-width: 340px
+    legend:
+    - width: 100%
+custom_fields:
+  sub: |
+    [[[
+      const R = states['sensor.tod_rate'];
+      if (!R) return '';
+      const a = R.attributes;
+      const day = new Date().toLocaleDateString(undefined, {weekday: 'long', month: 'short', day: 'numeric'});
+      const note = a.day_type === 'Weekday' ? 'Weekday' : a.day_type + ' — Off-Peak all day';
+      return `${day} · ${note} · now ${a.period} ${Number(R.state).toFixed(2)}¢/kWh`;
+    ]]]
+  clock: |
+    [[[
+      const R = states['sensor.tod_rate'];
+      if (!R) return 'sensor.tod_rate unavailable';
+      const a = R.attributes;
+      const ms = Number(a.mid_start_hour ?? 7), os = Number(a.on_start_hour ?? 17), oe = Number(a.on_end_hour ?? 21);
+      const offDay = a.day_type !== 'Weekday';
+      const per = h => offDay ? 'Off-Peak' : (h >= os && h < oe) ? 'On-Peak' : (h >= ms && h < os) ? 'Mid-Peak' : 'Off-Peak';
+      const C = {'Off-Peak': '#2e9d4f', 'Mid-Peak': '#f2c037', 'On-Peak': '#d64545'};
+      const ang = h => (h / 24) * 2 * Math.PI - Math.PI / 2;
+      const pt = (r, h) => [(r * Math.cos(ang(h))).toFixed(2), (r * Math.sin(ang(h))).toFixed(2)];
+      const lbl = h => h === 0 ? '12a' : h === 12 ? '12p' : h < 12 ? h + 'a' : (h - 12) + 'p';
+      const RO = 86, RI = 56;
+      let s = '';
+      for (let h = 0; h < 24; h++) {
+        const [x1, y1] = pt(RO, h), [x2, y2] = pt(RO, h + 1), [x3, y3] = pt(RI, h + 1), [x4, y4] = pt(RI, h);
+        s += `<path d="M${x1} ${y1} A${RO} ${RO} 0 0 1 ${x2} ${y2} L${x3} ${y3} A${RI} ${RI} 0 0 0 ${x4} ${y4}Z"
+               fill="${C[per(h)]}" stroke="var(--card-background-color,#fff)" stroke-width="0.8"/>`;
+        const [lx, ly] = pt(98, h);
+        s += h % 3 === 0
+          ? `<text x="${lx}" y="${ly}" font-size="9" text-anchor="middle" dominant-baseline="central" fill="var(--primary-text-color)">${lbl(h)}</text>`
+          : `<circle cx="${lx}" cy="${ly}" r="1" fill="var(--secondary-text-color)"/>`;
+      }
+      const n = new Date();
+      const deg = ((n.getHours() + n.getMinutes() / 60) / 24) * 360;
+      const cur = C[a.period] || 'var(--primary-text-color)';
+      const halo = 'paint-order="stroke" stroke="var(--card-background-color,#fff)" stroke-width="4" stroke-linejoin="round"';
+      s += `<g transform="rotate(${deg.toFixed(2)})">
+              <line x1="0" y1="8" x2="0" y2="${-(RO - 4)}" stroke="var(--primary-text-color)" stroke-width="3" stroke-linecap="round"/>
+              <polygon points="0,${-(RO + 6)} -7,${-(RO - 8)} 7,${-(RO - 8)}" fill="var(--primary-text-color)"
+                       stroke="var(--card-background-color,#fff)" stroke-width="1"/>
+            </g>
+            <circle r="5" fill="var(--primary-text-color)"/>`;
+      s += `<text y="-16" font-size="11" text-anchor="middle" fill="var(--secondary-text-color)" ${halo}>${a.period}</text>
+            <text y="24" font-size="15" font-weight="600" text-anchor="middle" fill="${cur}" ${halo}>${Number(R.state).toFixed(2)}¢</text>`;
+      return `<svg viewBox="-112 -112 224 224" style="width:100%;height:auto;display:block">${s}</svg>`;
+    ]]]
+  legend: |
+    [[[
+      // Schedule 203: export first cancels import in the same TOD period;
+      // surplus (plus carried-in bank, billing period only) then cancels import
+      // highest rate first. Rows show today; the last line shows the billing period.
+      const R = states['sensor.tod_rate'], T = states['sensor.tod_today'], B = states['sensor.tod_bill'];
+      if (!R) return '';
+      const a = R.attributes, rates = a.rates || {};
+      const ms = Number(a.mid_start_hour ?? 7), os = Number(a.on_start_hour ?? 17), oe = Number(a.on_end_hour ?? 21);
+      const order = a.credit_order || ['On-Peak', 'Mid-Peak', 'Off-Peak'];
+      const net = (imp, exp, bank) => {
+        const res = {};
+        let pool = bank;
+        for (const p of order) {
+          const i = Number(imp[p] || 0), e = Number(exp[p] || 0), m = Math.min(i, e);
+          res[p] = {imp: i, exp: e, rem: i - m, cred: m};
+          pool += e - m;
+        }
+        for (const p of order) {
+          const use = Math.min(pool, res[p].rem);
+          res[p].rem -= use; res[p].cred += use; pool -= use;
+        }
+        let cost = 0, cred = 0, used = 0;
+        for (const p of order) {
+          const r = Number(rates[p] || 0);
+          res[p].cost = res[p].rem * r / 100; res[p].cv = res[p].cred * r / 100;
+          cost += res[p].cost; cred += res[p].cv; used += res[p].imp;
+        }
+        return {res, pool, cost, cred, used};
+      };
+      const t = T ? T.attributes : {}, b = B ? B.attributes : {};
+      const bank = Number(b.bank_kwh || 0);
+      const D = net(t.import_kwh || {}, t.export_kwh || {}, 0);
+      const P = net(b.import_kwh || {}, b.export_kwh || {}, bank);
+      const C = {'Off-Peak': '#2e9d4f', 'Mid-Peak': '#f2c037', 'On-Peak': '#d64545'};
+      const f = h => h === 0 || h === 24 ? '12a' : h === 12 ? '12p' : h < 12 ? h + 'a' : (h - 12) + 'p';
+      const hrs = {'Off-Peak': `${f(oe)}–${f(ms)} + wknd/hol`, 'Mid-Peak': `${f(ms)}–${f(os)} wkdy`, 'On-Peak': `${f(os)}–${f(oe)} wkdy`};
+      const usd = v => (v < 0 ? '−' : '') + '$' + Math.abs(v).toFixed(2);
+      const credit = (v, k) => k > 0.005 ? '−' + usd(v) : usd(0);
+      const small = s => `<div style="font-size:10px;color:var(--secondary-text-color);font-weight:400">${s}</div>`;
+      const th = 'padding:2px 4px;font-weight:500;text-align:right';
+      const td = 'padding:4px;text-align:right;white-space:nowrap';
+      const day = new Date().toLocaleDateString(undefined, {weekday: 'short', month: 'short', day: 'numeric'});
+      let h = `<table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr style="color:var(--secondary-text-color);font-size:11px">
+          <th style="${th};text-align:left">Today · ${day}</th><th style="${th}">Rate</th><th style="${th}">Used</th>
+          <th style="${th}">Solar credit</th><th style="${th}">Cost</th></tr>`;
+      for (const p of ['Off-Peak', 'Mid-Peak', 'On-Peak']) {
+        const r = Number(rates[p] || 0), x = D.res[p];
+        const now = p === a.period ? `background:${C[p]}22;font-weight:600` : '';
+        h += `<tr style="${now};border-top:1px solid var(--divider-color)">
+          <td style="${td};text-align:left">
+            <span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:${C[p]};margin-right:6px;vertical-align:-1px"></span>${p}
+            <div style="font-size:10px;color:var(--secondary-text-color);font-weight:400;margin-left:18px">${hrs[p]}</div></td>
+          <td style="${td}">${r.toFixed(2)}¢</td>
+          <td style="${td}">${x.imp.toFixed(1)} kWh</td>
+          <td style="${td};color:#2e9d4f">${credit(x.cv, x.cred)}${small(x.cred.toFixed(1) + ' kWh · out ' + x.exp.toFixed(1))}</td>
+          <td style="${td}">${usd(x.cost)}${small(x.rem.toFixed(1) + ' kWh billed')}</td></tr>`;
+      }
+      const since = b.bill_start ? new Date(b.bill_start + 'T00:00').toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) : '—';
+      h += `<tr style="border-top:2px solid var(--divider-color);font-weight:700">
+          <td style="${td};text-align:left" colspan="2">Today</td><td style="${td}">${D.used.toFixed(1)} kWh</td>
+          <td style="${td};color:#2e9d4f">${credit(D.cred, D.cred)}</td><td style="${td};font-size:15px">${usd(D.cost)}</td></tr>
+        <tr style="border-top:1px solid var(--divider-color);font-weight:600">
+          <td style="${td};text-align:left" colspan="2">Since ${since}${small('billing period to date')}</td><td style="${td}">${P.used.toFixed(1)} kWh</td>
+          <td style="${td};color:#2e9d4f">${credit(P.cred, P.cred)}</td><td style="${td};font-size:15px">${usd(P.cost)}${small('On-Peak ' + usd(P.res['On-Peak'].cost))}</td></tr>
+        <tr><td colspan="5" style="padding:4px;font-size:10px;color:var(--secondary-text-color);white-space:normal">
+          Today nets only today's solar; the billing period also uses the credit bank (in ${bank.toFixed(1)} kWh · carrying forward ${P.pool.toFixed(1)} kWh) ·
+          solar credits apply On → Mid → Off-Peak (Sch. 203) · excludes Basic charge, adjustments and taxes</td></tr></table>`;
+      return h;
+    ]]]

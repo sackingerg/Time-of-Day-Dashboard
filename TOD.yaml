@@ -1,0 +1,237 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TIME-OF-DAY (TOD) ELECTRIC RATE + COST / SOLAR NET-METERING — HA PACKAGE
+# File: TOD.yaml   (dashboard card: TOD.dashboard)
+#
+# INSTALL
+#   1. configuration.yaml must load packages:
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Copy this file to /config/packages/TOD.yaml.
+#   3. Set grid_power_entity (below) to your grid power sensor in watts,
+#      positive = importing from the grid, negative = exporting (solar).
+#   4. Set the rates, peak hours and billing day for your utility.
+#   5. Developer Tools → YAML → "Template entities" reload (or restart).
+#
+# SENSORS
+#   sensor.tod_rate    current rate in ¢/kWh. Attributes: period (Off-Peak /
+#                      Mid-Peak / On-Peak), day_type (Weekday / Weekend /
+#                      Holiday), rates, credit_order and the period hours.
+#   sensor.tod_today   today's grid import cost at TOD rates, before solar
+#                      credits. Attributes import_kwh / export_kwh hold
+#                      today's kWh per period.
+#   sensor.tod_bill    estimated energy charge for the billing period so far,
+#                      after net-metering credits. Attributes: bill_start,
+#                      bank_kwh (credit kWh carried in), import_kwh, export_kwh.
+#
+# HOW ENERGY IS COUNTED
+#   Grid power is integrated every minute and on every change, and each slice
+#   of energy is booked to the TOD period it was used in. Gaps longer than
+#   max_gap_s (HA down, sensor offline) are skipped. Values build up from the
+#   moment the package loads; there is no back-fill from history.
+#
+# CREDIT RULES (Portland General Electric Schedule 203, Time of Use)
+#   Credits are kWh, netted per monthly billing period:
+#     1. export in a period cancels import in that same period;
+#     2. any surplus, plus the carried-in bank, cancels import highest rate
+#        first: On-Peak, then Mid-Peak, then Off-Peak;
+#     3. what is left carries to the next billing period;
+#     4. the bank is zeroed when the annual cycle restarts (cycle_start_month).
+#   Other utilities: change the rates, hours, holidays and credit_order.
+#   Estimates exclude the basic charge, taxes and fees.
+#
+# HOLIDAYS (Off-Peak all day)
+#   New Year's Day, Memorial Day, Independence Day, Labor Day, Thanksgiving,
+#   Christmas. Saturday holidays move to Friday, Sunday holidays to Monday.
+# ─────────────────────────────────────────────────────────────────────────────
+
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: state
+        entity_id: sensor.YOUR_GRID_POWER
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+    actions:
+      - variables:
+          # ---- TOD RATES (¢/kWh, energy + transmission + distribution) ----
+          rate_off: 8.93       # 9 PM–7 AM weekdays; all day Sat, Sun, holidays
+          rate_mid: 16.70      # 7 AM–5 PM weekdays
+          rate_on: 43.13       # 5–9 PM weekdays
+          mid_start_hour: 7
+          on_start_hour: 17
+          on_end_hour: 21
+          # ---- BILLING (see header) ----
+          billing_start_day: 1   # first day of "Service period" on your bill (1–28)
+          cycle_start_month: 4   # month the cycle-restart billing period begins
+          seed_bank_kwh: 0       # credit kWh banked on your latest bill
+          # ---- INTEGRATION ----
+          grid_power_entity: sensor.YOUR_GRID_POWER   # W, + import / − export
+          max_gap_s: 600       # longer gaps between samples are not integrated
+
+          # Holidays, with Sat → preceding Fri and Sun → following Mon.
+          # Next year's Jan 1 is included because it can land on Dec 31.
+          day_type: >-
+            {% set t = now() %}
+            {% set y = t.year %}
+            {% set ns = namespace(h=[]) %}
+            {% for yy, m, dd in [[y, 1, 1], [y, 7, 4], [y, 12, 25], [y + 1, 1, 1]] %}
+              {% set f = t.replace(year=yy, month=m, day=dd).date() %}
+              {% if f.weekday() == 5 %}{% set f = f - timedelta(days=1) %}
+              {% elif f.weekday() == 6 %}{% set f = f + timedelta(days=1) %}{% endif %}
+              {% set ns.h = ns.h + [f] %}
+            {% endfor %}
+            {% set may31 = t.replace(month=5, day=31).date() %}
+            {% set sep1 = t.replace(month=9, day=1).date() %}
+            {% set nov1 = t.replace(month=11, day=1).date() %}
+            {% set ns.h = ns.h + [
+                 may31 - timedelta(days=may31.weekday()),
+                 sep1 + timedelta(days=(7 - sep1.weekday()) % 7),
+                 nov1 + timedelta(days=(3 - nov1.weekday()) % 7 + 21)] %}
+            {% if t.date() in ns.h %}Holiday
+            {% elif t.weekday() >= 5 %}Weekend
+            {% else %}Weekday{% endif %}
+          period: >-
+            {% set h = now().hour %}
+            {% if day_type != 'Weekday' %}Off-Peak
+            {% elif h >= on_start_hour and h < on_end_hour %}On-Peak
+            {% elif h >= mid_start_hour and h < on_start_hour %}Mid-Peak
+            {% else %}Off-Peak{% endif %}
+          rates: "{{ {'Off-Peak': rate_off, 'Mid-Peak': rate_mid, 'On-Peak': rate_on} }}"
+          # Schedule 203 crediting order for surplus and bank: highest rate first
+          credit_order: "{{ ['On-Peak', 'Mid-Peak', 'Off-Peak'] }}"
+          today: "{{ now().date() | string }}"
+          bill_start: >-
+            {% set t = now() %}
+            {% set d = billing_start_day | int(1) %}
+            {% if t.day >= d %}{{ t.replace(day=d).date() | string }}
+            {% else %}{{ (t.replace(day=1) - timedelta(days=1)).replace(day=d).date() | string }}{% endif %}
+          now_ts: "{{ as_timestamp(now()) }}"
+          grid_w: "{{ states(grid_power_entity) | float(0) }}"
+    sensor:
+      - name: TOD Rate
+        unique_id: tod_rate
+        default_entity_id: sensor.tod_rate
+        unit_of_measurement: "¢/kWh"
+        icon: mdi:clock-time-four-outline
+        state: "{{ rates[period] }}"
+        attributes:
+          period: "{{ period }}"
+          day_type: "{{ day_type }}"
+          rates: "{{ rates }}"
+          credit_order: "{{ credit_order }}"
+          mid_start_hour: "{{ mid_start_hour }}"
+          on_start_hour: "{{ on_start_hour }}"
+          on_end_hour: "{{ on_end_hour }}"
+
+      # The kWh attributes below read the PREVIOUS sample (this.attributes) and
+      # book the energy since then to the period that sample was taken in.
+      - name: TOD Today
+        unique_id: tod_today
+        default_entity_id: sensor.tod_today
+        unit_of_measurement: USD
+        device_class: monetary
+        icon: mdi:cash-clock
+        state: >-
+          {% set a = this.attributes %}
+          {% set i = a.get('import_kwh') if a.get('date') == today and a.get('import_kwh') is mapping else {} %}
+          {% set ns = namespace(c=0) %}
+          {% for p, r in rates.items() %}{% set ns.c = ns.c + i.get(p, 0) | float(0) * r / 100 %}{% endfor %}
+          {{ ns.c | round(4) }}
+        attributes:
+          date: "{{ today }}"
+          last_ts: "{{ now_ts }}"
+          last_w: "{{ grid_w }}"
+          last_period: "{{ period }}"
+          import_kwh: >-
+            {% set a = this.attributes %}
+            {% set same = a.get('date') == today %}
+            {% set old = a.get('import_kwh') if same and a.get('import_kwh') is mapping else {} %}
+            {% set dt = now_ts | float(0) - a.get('last_ts', now_ts) | float(0) %}
+            {% set w = a.get('last_w', 0) | float(0) %}
+            {% set inc = w * dt / 3600000 if same and dt > 0 and dt <= max_gap_s and w > 0 else 0 %}
+            {% set lp = a.get('last_period') %}
+            {{ {'Off-Peak': (old.get('Off-Peak', 0) + (inc if lp == 'Off-Peak' else 0)) | round(5),
+                'Mid-Peak': (old.get('Mid-Peak', 0) + (inc if lp == 'Mid-Peak' else 0)) | round(5),
+                'On-Peak':  (old.get('On-Peak', 0)  + (inc if lp == 'On-Peak'  else 0)) | round(5)} }}
+          export_kwh: >-
+            {% set a = this.attributes %}
+            {% set same = a.get('date') == today %}
+            {% set old = a.get('export_kwh') if same and a.get('export_kwh') is mapping else {} %}
+            {% set dt = now_ts | float(0) - a.get('last_ts', now_ts) | float(0) %}
+            {% set w = a.get('last_w', 0) | float(0) %}
+            {% set inc = -w * dt / 3600000 if same and dt > 0 and dt <= max_gap_s and w < 0 else 0 %}
+            {% set lp = a.get('last_period') %}
+            {{ {'Off-Peak': (old.get('Off-Peak', 0) + (inc if lp == 'Off-Peak' else 0)) | round(5),
+                'Mid-Peak': (old.get('Mid-Peak', 0) + (inc if lp == 'Mid-Peak' else 0)) | round(5),
+                'On-Peak':  (old.get('On-Peak', 0)  + (inc if lp == 'On-Peak'  else 0)) | round(5)} }}
+
+      # Same integration as TOD Today, but accumulated over the billing period.
+      # State and bank_kwh both run the Schedule 203 crediting (see header) on
+      # the previous sample; the two copies must stay identical.
+      - name: TOD Bill
+        unique_id: tod_bill
+        default_entity_id: sensor.tod_bill
+        unit_of_measurement: USD
+        device_class: monetary
+        icon: mdi:receipt-text-clock
+        state: >-
+          {% set a = this.attributes %}
+          {% set i = a.get('import_kwh') if a.get('import_kwh') is mapping else {} %}
+          {% set e = a.get('export_kwh') if a.get('export_kwh') is mapping else {} %}
+          {% set ns = namespace(pool=a.get('bank_kwh', seed_bank_kwh) | float(0), cost=0) %}
+          {% for p in credit_order %}{% set ns.pool = ns.pool + [e.get(p, 0) | float(0) - i.get(p, 0) | float(0), 0] | max %}{% endfor %}
+          {% for p in credit_order %}
+            {% set r = [i.get(p, 0) | float(0) - e.get(p, 0) | float(0), 0] | max %}
+            {% set use = [ns.pool, r] | min %}
+            {% set ns.pool = ns.pool - use %}
+            {% set ns.cost = ns.cost + (r - use) * rates[p] / 100 %}
+          {% endfor %}
+          {{ ns.cost | round(4) }}
+        attributes:
+          bill_start: "{{ bill_start }}"
+          last_ts: "{{ now_ts }}"
+          last_w: "{{ grid_w }}"
+          last_period: "{{ period }}"
+          # Credit kWh carried INTO this billing period. On rollover it becomes
+          # the old period's leftover, or 0 when the annual cycle restarts.
+          bank_kwh: >-
+            {% set a = this.attributes %}
+            {% if a.get('bill_start') is none %}{{ seed_bank_kwh | float(0) }}
+            {% elif a.get('bill_start') == bill_start %}{{ a.get('bank_kwh', 0) | float(0) }}
+            {% elif bill_start[5:7] | int == cycle_start_month | int %}0
+            {% else %}
+              {% set i = a.get('import_kwh') if a.get('import_kwh') is mapping else {} %}
+              {% set e = a.get('export_kwh') if a.get('export_kwh') is mapping else {} %}
+              {% set ns = namespace(pool=a.get('bank_kwh', 0) | float(0)) %}
+              {% for p in credit_order %}{% set ns.pool = ns.pool + [e.get(p, 0) | float(0) - i.get(p, 0) | float(0), 0] | max %}{% endfor %}
+              {% for p in credit_order %}
+                {% set r = [i.get(p, 0) | float(0) - e.get(p, 0) | float(0), 0] | max %}
+                {% set ns.pool = ns.pool - ([ns.pool, r] | min) %}
+              {% endfor %}
+              {{ ns.pool | round(5) }}
+            {% endif %}
+          import_kwh: >-
+            {% set a = this.attributes %}
+            {% set same = a.get('bill_start') == bill_start %}
+            {% set old = a.get('import_kwh') if same and a.get('import_kwh') is mapping else {} %}
+            {% set dt = now_ts | float(0) - a.get('last_ts', now_ts) | float(0) %}
+            {% set w = a.get('last_w', 0) | float(0) %}
+            {% set inc = w * dt / 3600000 if same and dt > 0 and dt <= max_gap_s and w > 0 else 0 %}
+            {% set lp = a.get('last_period') %}
+            {{ {'Off-Peak': (old.get('Off-Peak', 0) + (inc if lp == 'Off-Peak' else 0)) | round(5),
+                'Mid-Peak': (old.get('Mid-Peak', 0) + (inc if lp == 'Mid-Peak' else 0)) | round(5),
+                'On-Peak':  (old.get('On-Peak', 0)  + (inc if lp == 'On-Peak'  else 0)) | round(5)} }}
+          export_kwh: >-
+            {% set a = this.attributes %}
+            {% set same = a.get('bill_start') == bill_start %}
+            {% set old = a.get('export_kwh') if same and a.get('export_kwh') is mapping else {} %}
+            {% set dt = now_ts | float(0) - a.get('last_ts', now_ts) | float(0) %}
+            {% set w = a.get('last_w', 0) | float(0) %}
+            {% set inc = -w * dt / 3600000 if same and dt > 0 and dt <= max_gap_s and w < 0 else 0 %}
+            {% set lp = a.get('last_period') %}
+            {{ {'Off-Peak': (old.get('Off-Peak', 0) + (inc if lp == 'Off-Peak' else 0)) | round(5),
+                'Mid-Peak': (old.get('Mid-Peak', 0) + (inc if lp == 'Mid-Peak' else 0)) | round(5),
+                'On-Peak':  (old.get('On-Peak', 0)  + (inc if lp == 'On-Peak'  else 0)) | round(5)} }}
